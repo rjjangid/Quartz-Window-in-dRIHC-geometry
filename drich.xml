@@ -149,6 +149,18 @@
     vis="DRICH_aerogel_vis"
     thickness="DRICH_aerogel_thickness"
     />
+  <coronas
+    segmentation="trapezoidal"
+    thickness="DRICH_corona_thickness"
+    material="CarbonFiber_15percent"
+    vis="DRICH_Corona_vis"
+    >
+    <crown radius="12.9596*cm" num_segments="10"/>
+    <crown radius="31.8*cm"    num_segments="18"/>
+    <crown radius="51.0*cm"    num_segments="24"/>
+    <crown radius="70.5*cm"    num_segments="30"/>
+    <crown radius="88.7962*cm"/>
+  </coronas>
   <airgap
     material="AirOptical"
     vis="DRICH_gas_vis"
@@ -160,6 +172,7 @@
     thickness="DRICH_filter_thickness"
     />
 </radiator>
+
 <!-- /detectors/detector/quartzwindow -->
 <documentation level="10">
 #### Quartz Window
