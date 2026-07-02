@@ -13,11 +13,9 @@
 #include <vector>
 
 #include <XML/Helper.h>
-#include <iostream>
 
 using namespace dd4hep;
 using namespace dd4hep::rec;
-using namespace std;
 
 #ifdef WITH_IRT2_SUPPORT
 #include <TFile.h>
@@ -82,7 +80,22 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
   auto aerogelMat       = desc.material(aerogelMatName);
   auto aerogelVis       = desc.visAttributes(aerogelElem.attr<std::string>(_Unicode(vis)));
   auto aerogelThickness = aerogelElem.attr<double>(_Unicode(thickness));
-  
+  // - aerogel structure
+  auto coronasElem      = radiatorElem.child(_Unicode(coronas));
+  auto coronasMat       = desc.material(coronasElem.attr<std::string>(_Unicode(material)));
+  auto coronasVis       = desc.visAttributes(coronasElem.attr<std::string>(_Unicode(vis)));
+  auto coronasThickness = coronasElem.attr<double>(_Unicode(thickness));
+  auto segmentationType = coronasElem.attr<std::string>("segmentation");
+  // read crown parameters from child <crown> elements
+  std::vector<double> radii;
+  std::vector<int> numSegments;
+  for (xml::Collection_t crownIt(coronasElem, _Unicode(crown)); crownIt; ++crownIt) {
+    xml::Component crownElem = crownIt;
+    radii.push_back(crownElem.attr<double>(_Unicode(radius)));
+    if (crownElem.hasAttr(_Unicode(num_segments)))
+      numSegments.push_back(crownElem.attr<int>(_Unicode(num_segments)));
+  }
+  int numCrowns = radii.size();
   // - filter
   auto filterElem      = radiatorElem.child(_Unicode(filter));
   auto filterMatName   = filterElem.attr<std::string>(_Unicode(material));
@@ -111,7 +124,8 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
   auto sensorboxRmin   = desc.constant<double>("DRICH_sensorbox_rmin");
   auto sensorboxRmax   = desc.constant<double>("DRICH_sensorbox_rmax");
   auto sensorboxDphi   = desc.constant<double>("DRICH_sensorbox_dphi");
-    // -quartz window added by DS, same shape as sensor box but smaller in length and different material and displaced
+  
+  // -quartz window added by DS, same shape as sensor box but smaller in length and different material and displaced
   auto quartzElem         = detElem.child(_Unicode(quartzwindow));
   auto quartzwinThickness = quartzElem.attr<double>("thickness");
   auto quartzwinRmin      = quartzElem.attr<double>("rmin");
@@ -357,40 +371,123 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
   // BUILD RADIATOR ====================================================================
 
   // solid and volume: create aerogel and filter
-  Cone aerogelSolid(aerogelThickness / 2, radiatorRmin, radiatorRmax,
-                    radiatorRmin + boreDelta * aerogelThickness / vesselLength,
-                    radiatorRmax + snoutDelta * aerogelThickness / snoutLength);
-  Cone airgapSolid(airgapThickness / 2, radiatorRmin + boreDelta * aerogelThickness / vesselLength,
-                   radiatorRmax + snoutDelta * aerogelThickness / snoutLength,
-                   radiatorRmin + boreDelta * (aerogelThickness + airgapThickness) / vesselLength,
-                   radiatorRmax + snoutDelta * (aerogelThickness + airgapThickness) / snoutLength);
-  Cone filterSolid(
-      filterThickness / 2,
-      radiatorRmin + boreDelta * (aerogelThickness + airgapThickness) / vesselLength,
-      radiatorRmax + snoutDelta * (aerogelThickness + airgapThickness) / snoutLength,
-      radiatorRmin +
-          boreDelta * (aerogelThickness + airgapThickness + filterThickness) / vesselLength,
-      radiatorRmax +
-          snoutDelta * (aerogelThickness + airgapThickness + filterThickness) / snoutLength);
 
-  Volume aerogelVol(detName + "_aerogel", aerogelSolid, aerogelMat);
-  Volume airgapVol(detName + "_airgap", airgapSolid, airgapMat);
-  Volume filterVol(detName + "_filter", filterSolid, filterMat);
-  aerogelVol.setVisAttributes(aerogelVis);
-  airgapVol.setVisAttributes(airgapVis);
-  filterVol.setVisAttributes(filterVis);
+  // ------------------------------------------------------------------------
+  Volume aerogelVol;
+  PlacedVolume aerogelPV;
+  DetElement aerogelDE;
+  double structureThickness = aerogelThickness;
+  auto radiatorPos = Position(0., 0., radiatorFrontplane + 0.5 * structureThickness) + originFront;
 
-  // aerogel placement and surface properties
-  // TODO [low-priority]: define skin properties for aerogel and filter
-  // FIXME: radiatorPitch might not be working correctly (not yet used)
-  auto radiatorPos = Position(0., 0., radiatorFrontplane + 0.5 * aerogelThickness) + originFront;
+  Cone aerogelSolid(aerogelThickness / 2.0, radiatorRmin, radiatorRmax,
+                    radiatorRmin + boreDelta * aerogelThickness / vesselLength, radiatorRmax);
   auto aerogelPlacement = Translation3D(radiatorPos) * // re-center to originFront
                           RotationY(radiatorPitch);    // change polar angle to specified pitch
-  auto aerogelPV        = gasvolVol.placeVolume(aerogelVol, aerogelPlacement);
-  DetElement aerogelDE(det, "aerogel_de", 0);
+  aerogelVol            = Volume(detName + "_aerogel", aerogelSolid, aerogelMat);
+  aerogelVol.setVisAttributes(aerogelVis);
+  aerogelPV = gasvolVol.placeVolume(aerogelVol, aerogelPlacement);
+  aerogelDE = DetElement(det, "aerogel_de", 0);
   aerogelDE.setPlacement(aerogelPV);
+
+  if (segmentationType == "trapezoidal") {
+    double crownHeight = structureThickness;
+    std::vector<double> innerRadiusBottoms_half;
+    std::vector<double> innerRadiusTops_half;
+    std::vector<double> outerRadiusBottoms_half;
+    std::vector<double> outerRadiusTops_half;
+
+    // Create and place individual crown volumes
+    for (int i = 0; i < numCrowns; i++) {
+      double centralRadius = radii[i];
+      double rMinBottom, rMinTop, rMaxBottom, rMaxTop;
+
+      if (i == 0) {
+
+        rMinBottom = centralRadius - boreDelta * (coronasThickness / 2.0) / vesselLength;
+        rMinTop    = rMinBottom + snoutDelta * aerogelThickness / snoutLength;
+        rMaxBottom = rMinBottom + boreDelta * coronasThickness / vesselLength;
+        rMaxTop    = rMinTop + boreDelta * coronasThickness / vesselLength;
+
+      } else {
+        double innerRadius = centralRadius - coronasThickness / 2.0;
+        double outerRadius = centralRadius + coronasThickness / 2.0;
+
+        // FIX PROTRUSION
+
+        if (i == numCrowns - 1) {
+          double safetyMargin = 0.05 * dd4hep::cm;
+          outerRadius -= safetyMargin;
+        }
+
+        rMinBottom = innerRadius;
+        rMinTop    = innerRadius;
+        rMaxBottom = outerRadius;
+        rMaxTop    = outerRadius;
+      }
+      innerRadiusBottoms_half.push_back(rMinBottom);
+      innerRadiusTops_half.push_back(rMinTop);
+      outerRadiusBottoms_half.push_back(rMaxBottom);
+      outerRadiusTops_half.push_back(rMaxTop);
+
+      Cone crownSolid(crownHeight / 2.0, rMinBottom, rMaxBottom, rMinTop, rMaxTop);
+      std::string crownName = "CarbonCrown_" + std::to_string(i);
+      Volume crownVol(crownName, crownSolid, coronasMat);
+      crownVol.setVisAttributes(coronasVis);
+
+      // Place crown volume directly in aerogel
+      aerogelVol.placeVolume(crownVol, Position(0., 0., 0.));
+    }
+
+    // Create and place individual segment volumes
+    for (int i = 0; i < numCrowns - 1; i++) {
+      int N = numSegments[i];
+
+      double rMin_Zminus = outerRadiusBottoms_half[i];
+      double rMax_Zminus = innerRadiusBottoms_half[i + 1];
+      double rMin_Zplus  = outerRadiusTops_half[i];
+      double rMax_Zplus  = innerRadiusTops_half[i + 1];
+
+      double segmentSpacing      = 2 * M_PI / N;
+      double segmentAngularWidth = coronasThickness / rMin_Zminus;
+
+      for (int p = 0; p < N; p++) {
+        double phiStart = p * segmentSpacing;
+        double phiEnd   = phiStart + segmentAngularWidth;
+
+        ConeSegment segmentSolid(crownHeight / 2.0, rMin_Zminus, rMax_Zminus, rMin_Zplus,
+                                 rMax_Zplus, phiStart, phiEnd);
+        std::string segName = "CarbonSegment_" + std::to_string(i) + "_" + std::to_string(p);
+        Volume segVol(segName, segmentSolid, coronasMat);
+        segVol.setVisAttributes(coronasVis);
+
+        // Place segment volume directly in aerogel
+        aerogelVol.placeVolume(segVol, Position(0., 0., 0.));
+      }
+    } //crown
+  } //trapezoidal
+
+  else if (segmentationType == "square") {
+    printout(WARNING, "DRICH_geo", "Square segmentation requested but not implemented yet.");
+  } //Square
+
+  Cone airgapSolid(airgapThickness / 2.0,
+                   radiatorRmin + boreDelta * structureThickness / vesselLength, radiatorRmax,
+                   radiatorRmin + boreDelta * (structureThickness + airgapThickness) / vesselLength,
+                   radiatorRmax);
+  Cone filterSolid(filterThickness / 2.0,
+                   radiatorRmin + boreDelta * (structureThickness + airgapThickness) / vesselLength,
+                   radiatorRmax,
+                   radiatorRmin + boreDelta *
+                                      (structureThickness + airgapThickness + filterThickness) /
+                                      vesselLength,
+                   radiatorRmax);
+
+  Volume airgapVol(detName + "_airgap", airgapSolid, airgapMat);
+  Volume filterVol(detName + "_filter", filterSolid, filterMat);
+  airgapVol.setVisAttributes(airgapVis);
+  filterVol.setVisAttributes(filterVis);
   
-      // quartz window placement
+        // quartz window placement
   float qw_slope    =  (quartzwinRmax - quartzwinRmin)/(quartzwinZmax-quartzwinZmin);
   float qw_intercpt =   quartzwinRmax - qw_slope*quartzwinZmax;
   double qw_angle    =   (atan(qw_slope)-(M_PI/2));
@@ -452,7 +549,6 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
   }
   
 
-
   // airgap and filter placement and surface properties
   if (!debugOptics) {
 
@@ -460,7 +556,7 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
         Translation3D(radiatorPos) * // re-center to originFront
         RotationY(radiatorPitch) *   // change polar angle
         Translation3D(0., 0.,
-                      (aerogelThickness + airgapThickness) / 2.); // move to aerogel backplane
+                      (structureThickness + airgapThickness) / 2.); // move to aerogel backplane
     auto airgapPV = gasvolVol.placeVolume(airgapVol, airgapPlacement);
     DetElement airgapDE(det, "airgap_de", 0);
     airgapDE.setPlacement(airgapPV);
@@ -470,22 +566,16 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
         Translation3D(radiatorPos) *             // re-center to originFront
         RotationY(radiatorPitch) *               // change polar angle
         Translation3D(0., 0.,
-                      (aerogelThickness + filterThickness) / 2.); // move to aerogel backplane
+                      (structureThickness + filterThickness) / 2.); // move to aerogel backplane
     auto filterPV = gasvolVol.placeVolume(filterVol, filterPlacement);
     DetElement filterDE(det, "filter_de", 0);
     filterDE.setPlacement(filterPV);
-    
+
 #if defined(WITH_IRT2_SUPPORT) || defined(WITH_IRT1_SUPPORT)
     // radiator z-positions (w.r.t. IP); only needed downstream if !debugOptics
     double aerogelZpos = vesselPos.z() + aerogelPV.position().z();
     double filterZpos  = vesselPos.z() + filterPV.position().z();
-   // Quartz window reference z-position: qw_zpos is the window centroid position
-    // local to the gasvol frame (see "quartz window placement" above), so it needs
-    // the same vesselPos.z() shift as aerogel/filter to become an IP-frame z-position.
     double quartzwinZpos = vesselPos.z() + qw_zpos;
-    cout << "quartzwinZpos(with vessel)" << quartzwinZpos << endl;
-    cout << "quartzwinZpos(without vessel)" << qw_zpos << endl;
-    cout << "vesselPos.z" << vesselPos.z() << endl;
 #endif
 
 #ifdef WITH_IRT1_SUPPORT
@@ -493,7 +583,7 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
     desc.add(Constant("DRICH_aerogel_zpos", std::to_string(aerogelZpos)));
     desc.add(Constant("DRICH_airgap_zpos", std::to_string(airgapZpos)));
     desc.add(Constant("DRICH_filter_zpos", std::to_string(filterZpos)));
-    desc.add(Constant("DRICH_QW_zpos", std::to_string(quartzwinZpos)));
+    desc.add(Constant("DRICH_QW_zpos", std::to_string(quartzwinZpos))); //RJ
 #endif
 
 #ifdef WITH_IRT2_SUPPORT
@@ -508,7 +598,6 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
           auto radiator = geometry->SetContainerVolume(cdet, "GasVolume", isec,
                                                        (G4LogicalVolume*)(0x0), 0, boundary);
           radiator->SetAlternativeMaterialName(gasvolMatName.c_str());
-         
         }
 
         {
@@ -518,7 +607,6 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
               geometry->AddFlatRadiator(cdet, "Aerogel", CherenkovDetector::Upstream, isec,
                                         (G4LogicalVolume*)(0x1), 0, surface, aerogelThickness / mm);
           radiator->SetAlternativeMaterialName(aerogelMatName.c_str());
-          
         }
 
         {
@@ -528,42 +616,7 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
               geometry->AddFlatRadiator(cdet, "Acrylic", CherenkovDetector::Upstream, isec,
                                         (G4LogicalVolume*)(0x2), 0, surface, filterThickness / mm);
           radiator->SetAlternativeMaterialName(filterMatName.c_str());
-         
         }
-        //RJ
-// ---- Correct IRT2 surface for Quartz Window ----
-{
- Rotation3D rot = RotationZ((isec + 0.5) * 2.0 * M_PI / nSectors) * tiltRotation;
-
-  // point on outer quartz-window surface
-   TVector3 P_local = rot * TVector3(quartzwinRmax2, 0, 0);
-
-  // same origin convention as the working EICrecon implementation
-   TVector3 origin(P_local.X(),P_local.Y(), quartzwinZpos + P_local.Z());
-   
-    TVector3 u = rot * TVector3(1,0,0); 
-    TVector3 v = rot * TVector3(0,1,0); //changing sign of normal, mirror << QW << sensor
-    auto* surface = new FlatSurface(origin, u, v);
-
-//std::cout<< "REGISTERING QW sector(IRT2) " << isec << " center=("<< surface->GetCenter().X() << ", "<< surface->GetCenter().Y() << ", "
-//<< surface->GetCenter().Z() << ") " << "normal=("<< surface->GetNormal().X() << ", "<< surface->GetNormal().Y() << ", "<< surface-//>GetNormal().Z() << ")"<< std::endl;
-
-      auto* radiator = geometry->AddFlatRadiator(
-             cdet,                    
-             "QuartzWindow",
-             CherenkovDetector::Downstream,
-             isec,
-             (G4LogicalVolume*)(0x3),
-             nullptr,
-             surface,
-             quartzwinThickness / mm
-             );
-
-   radiator->SetAlternativeMaterialName(quartzwinMat.ptr()->GetName());
-
-//std::cout<< "Added QuartzWindow boundary sector (IRT2) "<< isec<< " at origin ("<< origin.X() << ", "<< origin.Y() << ", "<< origin.Z() << ")"
-//<< std::endl;
-}//RJ
       } //for isec
     }
 #endif
@@ -1054,13 +1107,7 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
 
                 // Wipe out sector bits; FIXME: it seems this is not really needed?;
                 auto irt = pd->AllocateIRT(isec, sensorID & sector_mask);
-                //printf("=== Sector %d ===\n", isec); //RJ
 
-//printf("Upstream boundaries = %zu\n",
-  //     cdet->m_OpticalBoundaries[CherenkovDetector::Upstream][isec].size());
-
-//printf("Downstream boundaries = %zu\n",
-       //cdet->m_OpticalBoundaries[CherenkovDetector::Downstream][isec].size()); //RJ
                 // Aerogel and acrylic;
                 if (cdet->m_OpticalBoundaries[CherenkovDetector::Upstream].find(isec) !=
                     cdet->m_OpticalBoundaries[CherenkovDetector::Upstream].end())
@@ -1072,23 +1119,9 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
 
                 // FIXME: eventually there should be a quartz window defined as part of the
                 // cdet->m_OpticalBoundaries[CherenkovDetector::Downstream] boundaries;
-                //RJ
-                if (cdet->m_OpticalBoundaries[CherenkovDetector::Downstream].find(isec) !=
-                      cdet->m_OpticalBoundaries[CherenkovDetector::Downstream].end()) {
-                  
-                 
-                  for (auto boundary :
-                    cdet->m_OpticalBoundaries[CherenkovDetector::Downstream][isec]) {
- // printf("  boundary=%p\n", (void*)boundary);
-                    irt->AddOpticalBoundary(boundary);
-                    } //RJ
 
-} 
- 
                 // Terminate the optical path;
                 pd->AddItselfToOpticalBoundaries(irt, surface);
-
-                
               }
 #endif
 #ifdef WITH_IRT1_SUPPORT
@@ -1125,10 +1158,7 @@ static Ref_t createDetector(Detector& desc, xml::Handle_t handle, SensitiveDetec
         } // end patch cuts
       } // end phiGen loop
     } // end thetaGen loop
-    //RJ
- // printf("Quartz z = %f\n", qw_zpos);
-//printf("Sensor z = %f\n", sensorSphPos.z()); 
-//EJ
+
     // END SENSOR MODULE LOOP ------------------------
 
 #ifdef WITH_IRT1_SUPPORT
